@@ -26,10 +26,12 @@ use ty_module_resolver::{ImportingFile, Module, ResolverFile};
 use ty_python_core::definition::{Definition, DefinitionKind, NestedBindingExecution};
 use ty_python_core::{ProgramFile, attribute_scopes, global_scope, semantic_index, use_def_map};
 
+mod name_resolution;
 mod unreachable_code;
 #[path = "ide_support/unused_bindings.rs"]
 mod unused_binding_support;
 
+pub use name_resolution::{DefinitionResolution, NameLoadResolution};
 pub use resolve_definition::{ImportAliasResolution, ResolvedDefinition, map_stub_definition};
 use resolve_definition::{find_symbol_in_scope, resolve_definition};
 pub use unreachable_code::{UnreachableKind, UnreachableRange, unreachable_ranges};
