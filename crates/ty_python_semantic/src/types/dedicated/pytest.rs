@@ -48,6 +48,9 @@ use ty_python_core::{ProgramFile, global_scope, place_table, semantic_index, use
 
 use crate::Db;
 use crate::types::function::FunctionType;
+use crate::types::ide_support::{
+    ResolvedDefinition, map_stub_definition, resolve_definition_targets,
+};
 use crate::types::infer::{function_known_decorators, infer_definition_types, original_class_type};
 use crate::types::signatures::Parameter as SignatureParameter;
 use crate::types::{
@@ -392,7 +395,8 @@ fn fixture_provider_names<'db>(
             let name = table.symbol(symbol_id).name().clone();
             let exposures = definitions
                 .filter_map(|binding| binding.binding.definition())
-                .filter_map(|definition| fixture_declaration(db, definition))
+                .flat_map(|definition| resolve_definition_targets(db, definition, &name))
+                .flat_map(|definition| fixture_declarations_for_definition(db, definition))
                 .filter_map(|declaration| fixture_exposure(&name, declaration))
                 .collect();
             FixtureProviderName { name, exposures }
@@ -459,9 +463,16 @@ fn bindings_in_provider<'db>(
                     }
                     Some(Ordering::Equal) => {}
                 }
+                let definition = exposure.declaration.definition;
+                if bindings
+                    .iter()
+                    .any(|binding: &FixtureBinding<'db>| binding.fixture == definition)
+                {
+                    continue;
+                }
                 bindings.push(FixtureBinding {
                     request: request.definition,
-                    fixture: exposure.declaration.definition,
+                    fixture: definition,
                 });
             }
         }
@@ -514,6 +525,24 @@ fn fixture_declaration<'db>(
     } else {
         None
     }
+}
+
+/// Returns fixture declarations for a definition, mapping a stub to its source when possible.
+fn fixture_declarations_for_definition<'db>(
+    db: &'db dyn Db,
+    definition: Definition<'db>,
+) -> Vec<FixtureDeclaration<'db>> {
+    if definition.file(db).is_stub(db) {
+        let resolved = ResolvedDefinition::Definition(definition);
+        if let Some(mapped) = map_stub_definition(db, &resolved, None) {
+            return mapped
+                .into_iter()
+                .filter_map(|resolved| resolved.definition())
+                .filter_map(|definition| fixture_declaration(db, definition))
+                .collect();
+        }
+    }
+    fixture_declaration(db, definition).into_iter().collect()
 }
 
 /// Classifies the `name` argument to a fixture decorator.
@@ -1447,6 +1476,292 @@ def test_use(value): ...
         assert_snapshot!(test_use.fixture_resolution("value"), @"No fixture resolved for parameter `value`");
     }
 
+    #[test]
+    fn resolves_imported_fixture_exposures() {
+        let test = PytestTestCase::with_files(
+            "/src/test_example.py",
+            &[
+                (
+                    "/src/fixtures.py",
+                    r#"
+import pytest
+
+@pytest.fixture
+def resource(): ...
+
+@pytest.fixture(name="public_name")
+def implementation(): ...
+"#,
+                ),
+                (
+                    "/src/reexports.py",
+                    r#"
+from fixtures import resource as middle
+"#,
+                ),
+                (
+                    "/src/star_fixtures.py",
+                    r#"
+import pytest
+
+@pytest.fixture
+def star_fixture(): ...
+"#,
+                ),
+                (
+                    "/src/test_example.py",
+                    r#"
+from fixtures import resource as direct_alias, implementation
+from reexports import middle as chained
+from star_fixtures import *
+
+def test_use(
+    direct_alias,
+    chained,
+    public_name,
+    implementation,
+    resource,
+    star_fixture,
+): ...
+"#,
+                ),
+            ],
+        );
+
+        let test_use = test.function("test_use");
+
+        assert_snapshot!(test_use.fixture_resolution("direct_alias"), @"
+        info[pytest-fixture]: Resolve fixture for parameter
+         --> src/test_example.py:7:5
+          |
+        7 |     direct_alias,
+          |     ^^^^^^^^^^^^ fixture requested here
+        info: Found 1 fixture
+         --> src/fixtures.py:5:5
+          |
+        5 | def resource(): ...
+          |     --------
+        ");
+
+        assert_snapshot!(test_use.fixture_resolution("chained"), @"
+        info[pytest-fixture]: Resolve fixture for parameter
+         --> src/test_example.py:8:5
+          |
+        8 |     chained,
+          |     ^^^^^^^ fixture requested here
+        info: Found 1 fixture
+         --> src/fixtures.py:5:5
+          |
+        5 | def resource(): ...
+          |     --------
+        ");
+
+        assert_snapshot!(test_use.fixture_resolution("public_name"), @"
+        info[pytest-fixture]: Resolve fixture for parameter
+         --> src/test_example.py:9:5
+          |
+        9 |     public_name,
+          |     ^^^^^^^^^^^ fixture requested here
+        info: Found 1 fixture
+         --> src/fixtures.py:8:5
+          |
+        8 | def implementation(): ...
+          |     --------------
+        ");
+
+        assert_snapshot!(test_use.fixture_resolution("star_fixture"), @"
+        info[pytest-fixture]: Resolve fixture for parameter
+          --> src/test_example.py:12:5
+           |
+        12 |     star_fixture,
+           |     ^^^^^^^^^^^^ fixture requested here
+        info: Found 1 fixture
+         --> src/star_fixtures.py:5:5
+          |
+        5 | def star_fixture(): ...
+          |     ------------
+        ");
+
+        assert_snapshot!(test_use.fixture_resolution("implementation"), @"No fixture resolved for parameter `implementation`");
+        assert_snapshot!(test_use.fixture_resolution("resource"), @"No fixture resolved for parameter `resource`");
+    }
+
+    #[test]
+    fn deduplicates_aliases_to_same_fixture_declaration() {
+        let test = PytestTestCase::with_files(
+            "/src/test_example.py",
+            &[
+                (
+                    "/src/fixtures.py",
+                    r#"
+import pytest
+
+@pytest.fixture(name="resource")
+def implementation(): ...
+"#,
+                ),
+                (
+                    "/src/test_example.py",
+                    r#"
+from fixtures import implementation
+from fixtures import implementation as second_exposure
+
+def test_use(resource): ...
+"#,
+                ),
+            ],
+        );
+
+        let test_use = test.function("test_use");
+
+        assert_snapshot!(test_use.fixture_resolution("resource"), @"
+        info[pytest-fixture]: Resolve fixture for parameter
+         --> src/test_example.py:5:14
+          |
+        5 | def test_use(resource): ...
+          |              ^^^^^^^^ fixture requested here
+        info: Found 1 fixture
+         --> src/fixtures.py:5:5
+          |
+        5 | def implementation(): ...
+          |     --------------
+        ");
+    }
+
+    #[test]
+    fn resolves_imported_fixture_declarations_from_source() {
+        let test = PytestTestCase::with_files(
+            "/src/test_example.py",
+            &[
+                (
+                    "/src/fixtures.py",
+                    r#"
+import pytest
+
+@pytest.fixture(name="public_name")
+def implementation(): ...
+"#,
+                ),
+                ("/src/fixtures.pyi", "def implementation() -> object: ...\n"),
+                (
+                    "/src/test_example.py",
+                    r#"
+from fixtures import implementation
+
+def test_use(public_name): ...
+"#,
+                ),
+            ],
+        );
+
+        let test_use = test.function("test_use");
+
+        assert_snapshot!(test_use.fixture_resolution("public_name"), @"
+        info[pytest-fixture]: Resolve fixture for parameter
+         --> src/test_example.py:4:14
+          |
+        4 | def test_use(public_name): ...
+          |              ^^^^^^^^^^^ fixture requested here
+        info: Found 1 fixture
+         --> src/fixtures.py:5:5
+          |
+        5 | def implementation(): ...
+          |     --------------
+        ");
+    }
+
+    #[test]
+    fn ignores_overwritten_imported_fixture_exposures() {
+        let test = PytestTestCase::with_files(
+            "/src/test_example.py",
+            &[
+                (
+                    "/src/fixtures.py",
+                    r#"
+import pytest
+
+@pytest.fixture
+def resource(): ...
+"#,
+                ),
+                (
+                    "/src/test_example.py",
+                    r#"
+from fixtures import resource
+
+resource = object()
+
+def test_use(resource): ...
+"#,
+                ),
+            ],
+        );
+
+        let test_use = test.function("test_use");
+
+        assert_snapshot!(test_use.fixture_resolution("resource"), @"No fixture resolved for parameter `resource`");
+    }
+
+    #[test]
+    fn preserves_conditional_imported_fixture_definitions() {
+        let test = PytestTestCase::with_files(
+            "/src/test_example.py",
+            &[
+                (
+                    "/src/first.py",
+                    r#"
+import pytest
+
+@pytest.fixture
+def first(): ...
+"#,
+                ),
+                (
+                    "/src/second.py",
+                    r#"
+import pytest
+
+@pytest.fixture
+def second(): ...
+"#,
+                ),
+                (
+                    "/src/test_example.py",
+                    r#"
+flag: bool
+
+if flag:
+    from first import first as resource
+else:
+    from second import second as resource
+
+def test_use(resource): ...
+"#,
+                ),
+            ],
+        );
+
+        let test_use = test.function("test_use");
+
+        assert_snapshot!(test_use.fixture_resolution("resource"), @"
+        info[pytest-fixture]: Resolve fixture for parameter
+         --> src/test_example.py:9:14
+          |
+        9 | def test_use(resource): ...
+          |              ^^^^^^^^ fixture requested here
+        info: Found 2 fixtures
+         --> src/first.py:5:5
+          |
+        5 | def first(): ...
+          |     -----
+          |
+         ::: src/second.py:5:5
+          |
+        5 | def second(): ...
+          |     ------
+        ");
+    }
+
     struct PytestTestCase {
         db: TestDb,
         path: &'static str,
@@ -1456,6 +1771,13 @@ def test_use(value): ...
         fn new(path: &'static str, source: &'static str) -> Self {
             Self {
                 db: pytest_db(path, source),
+                path,
+            }
+        }
+
+        fn with_files(path: &'static str, files: &[(&'static str, &'static str)]) -> Self {
+            Self {
+                db: pytest_db_with_files(files),
                 path,
             }
         }
@@ -1563,7 +1885,11 @@ def test_use(value): ...
     }
 
     fn pytest_db(path: &'static str, source: &'static str) -> TestDb {
-        TestDbBuilder::new()
+        pytest_db_with_files(&[(path, source)])
+    }
+
+    fn pytest_db_with_files(files: &[(&'static str, &'static str)]) -> TestDb {
+        let mut builder = TestDbBuilder::new()
             .with_third_party_packages()
             .with_file(
                 "/.venv/lib/python3.13/site-packages/_pytest/__init__.pyi",
@@ -1609,9 +1935,10 @@ from _pytest.mark.structures import MarkGenerator
 
 mark: MarkGenerator
 "#,
-            )
-            .with_file(path, source)
-            .build()
-            .expect("valid pytest test database")
+            );
+        for (path, source) in files {
+            builder = builder.with_file(*path, source);
+        }
+        builder.build().expect("valid pytest test database")
     }
 }
