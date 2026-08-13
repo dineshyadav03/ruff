@@ -106,7 +106,7 @@ use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{any_over_type, dynamic_content};
 use crate::{Db, FxOrderSet, HasType, NameKind, Program, SemanticModel};
 pub(crate) use class::{ClassLiteral, ClassType, GenericAlias, StaticClassLiteral};
-pub use class::{KnownClass, MethodDecorator, SlotDescriptorKind, SlotDescriptorType};
+pub use class::{KnownClass, MethodDecorator, SlotDescriptorType};
 use instance::Protocol;
 pub use instance::{NominalInstanceType, ProtocolInstanceType};
 pub(crate) use literal::{
@@ -965,42 +965,6 @@ struct MemberLookupKey<'db> {
     name: Name,
     #[returns(copy)]
     policy: MemberLookupPolicy,
-}
-
-impl<'db> MemberLookupKey<'db> {
-    /// Excludes inherited instance attributes that require storage the receiver does not have.
-    ///
-    /// Typeshed declares `object.__dict__` for every object, but a slotted instance without
-    /// dictionary storage cannot expose that inherited attribute:
-    ///
-    /// ```python
-    /// class Example:
-    ///     __slots__ = ()
-    ///
-    /// Example().__dict__  # Raises AttributeError.
-    /// ```
-    ///
-    /// Skipping only `object` preserves class-defined `__dict__` descriptors and allows normal
-    /// `__getattr__` fallback.
-    fn with_instance_storage_policy(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Self {
-        let ty = self.ty(db);
-        if self.name(db) == "__dict__"
-            && let Some((class, _)) = ty
-                .nominal_class(db, env)
-                .and_then(|class| class.static_class_literal(db))
-            && class.lacks_instance_storage(db, "__dict__")
-        {
-            Self::new(
-                db,
-                self.program(db),
-                ty,
-                self.name(db).as_str(),
-                self.policy(db) | MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK,
-            )
-        } else {
-            self
-        }
-    }
 }
 
 /// Meta data for `Type::Todo`, which represents a known limitation in ty.
@@ -2019,9 +1983,9 @@ impl<'db> Type<'db> {
             Type::PropertyInstance(property) => {
                 property.instance_fallback(db, env).nominal_class(db, env)
             }
-            Type::SlotDescriptor(descriptor) => {
-                descriptor.instance_fallback(db, env).nominal_class(db, env)
-            }
+            Type::SlotDescriptor(_) => KnownClass::MemberDescriptorType
+                .to_instance(db, env)
+                .nominal_class(db, env),
             _ => None,
         }
     }
@@ -2851,13 +2815,7 @@ impl<'db> Type<'db> {
             Type::SlotDescriptor(descriptor) => descriptor
                 .value_type(db)
                 .recursive_type_normalized_impl(db, env, div, true)
-                .map(|value_type| {
-                    Type::SlotDescriptor(SlotDescriptorType::new(
-                        db,
-                        value_type,
-                        descriptor.kind(db),
-                    ))
-                }),
+                .map(|value_type| Type::SlotDescriptor(SlotDescriptorType::new(db, value_type))),
             Type::KnownBoundMethod(method_kind) => method_kind
                 .recursive_type_normalized_impl(db, env, div, nested)
                 .map(Type::KnownBoundMethod),
@@ -3437,7 +3395,6 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         key: MemberLookupKey<'db>,
     ) -> PlaceAndQualifiers<'db> {
-        let key = key.with_instance_storage_policy(db, env);
         let ty = key.ty(db);
 
         if let Type::TypeVar(_) = ty {
@@ -3794,8 +3751,8 @@ impl<'db> Type<'db> {
                 .to_instance(db, env)
                 .instance_member(db, env, name),
 
-            Type::SlotDescriptor(descriptor) => descriptor
-                .instance_fallback(db, env)
+            Type::SlotDescriptor(_) => KnownClass::MemberDescriptorType
+                .to_instance(db, env)
                 .instance_member(db, env, name),
 
             // Note: `super(pivot, owner).__dict__` refers to the `__dict__` of the `builtins.super` instance,
@@ -4453,8 +4410,7 @@ impl<'db> Type<'db> {
         // Unlike an arbitrary data descriptor, its inherited getter must not hide a more precise
         // declaration established by the receiver's class.
         if matches!(meta_attr, Place::Defined(_))
-            && let Some(Type::SlotDescriptor(descriptor)) = meta_attr_ty
-            && descriptor.is_writable(db)
+            && matches!(meta_attr_ty, Some(Type::SlotDescriptor(_)))
             && !fallback_member.place.is_undefined()
         {
             return member_lookup_result(db, fallback_member, fallback_error);
@@ -7498,9 +7454,7 @@ impl<'db> Type<'db> {
             Type::PropertyInstance(property) => {
                 property.instance_class(db).to_class_literal(db, env)
             }
-            Type::SlotDescriptor(descriptor) => {
-                descriptor.instance_class(db).to_class_literal(db, env)
-            }
+            Type::SlotDescriptor(_) => KnownClass::MemberDescriptorType.to_class_literal(db, env),
             Type::Union(union) => union.map(db, env, |ty| ty.to_meta_type(db, env)),
             Type::TypeIs(_) | Type::TypeGuard(_) => KnownClass::Bool.to_class_literal(db, env),
             Type::TypeForm(_) => Type::object().to_meta_type(db, env),
@@ -7883,7 +7837,6 @@ impl<'db> Type<'db> {
                 descriptor
                     .value_type(db)
                     .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
-                descriptor.kind(db),
             )),
 
             Type::Union(union) => union.map_leave_aliases(db, visitor.env, |element| {
@@ -8622,9 +8575,9 @@ impl<'db> Type<'db> {
                         .and_then(|deleter| deleter.definition(db, env))
                 }),
 
-            Self::SlotDescriptor(descriptor) => {
-                descriptor.instance_fallback(db, env).definition(db, env)
-            }
+            Self::SlotDescriptor(_) => KnownClass::MemberDescriptorType
+                .to_instance(db, env)
+                .definition(db, env),
 
             Self::LiteralValue(literal) => literal
                 .as_enum()
@@ -9067,16 +9020,10 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
                 .chain(&property_instance_type.deleter(db))
                 .map(|ty| ty.variance_of(db, env, typevar))
                 .collect(),
-            Type::SlotDescriptor(descriptor) => {
-                let value_type = descriptor.value_type(db);
-                if descriptor.is_writable(db) {
-                    value_type
-                        .with_polarity(TypeVarVariance::Invariant)
-                        .variance_of(db, env, typevar)
-                } else {
-                    value_type.variance_of(db, env, typevar)
-                }
-            }
+            Type::SlotDescriptor(descriptor) => descriptor
+                .value_type(db)
+                .with_polarity(TypeVarVariance::Invariant)
+                .variance_of(db, env, typevar),
             Type::SubclassOf(subclass_of_type) => subclass_of_type.variance_of(db, env, typevar),
             Type::TypeIs(type_is_type) => type_is_type.variance_of(db, env, typevar),
             Type::TypeGuard(type_guard_type) => type_guard_type.variance_of(db, env, typevar),
