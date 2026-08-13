@@ -3189,28 +3189,24 @@ impl<'db> Type<'db> {
                         // Hard code this knowledge, as we look up `__set__` and `__delete__` on `FunctionType` often.
                         Some(Place::Undefined.into())
                     }
-                    (
-                        Some(
-                            descriptor_class @ (KnownClass::Property
-                            | KnownClass::EnumProperty
-                            | KnownClass::MemberDescriptorType
-                            | KnownClass::GetSetDescriptorType),
-                        ),
-                        "__get__" | "__set__" | "__delete__",
-                    ) if name != "__delete__" || descriptor_class != KnownClass::EnumProperty => {
-                        Some(
-                            Place::bound(Type::WrapperDescriptor(match name {
-                                "__get__" => {
-                                    WrapperDescriptorKind::PropertyDunderGet(descriptor_class)
-                                }
-                                "__set__" => {
-                                    WrapperDescriptorKind::PropertyDunderSet(descriptor_class)
-                                }
-                                _ => WrapperDescriptorKind::PropertyDunderDelete(descriptor_class),
-                            }))
-                            .into(),
-                        )
-                    }
+                    (Some(KnownClass::Property | KnownClass::EnumProperty), "__get__") => Some(
+                        Place::bound(Type::WrapperDescriptor(
+                            WrapperDescriptorKind::PropertyDunderGet,
+                        ))
+                        .into(),
+                    ),
+                    (Some(KnownClass::Property | KnownClass::EnumProperty), "__set__") => Some(
+                        Place::bound(Type::WrapperDescriptor(
+                            WrapperDescriptorKind::PropertyDunderSet,
+                        ))
+                        .into(),
+                    ),
+                    (Some(KnownClass::Property), "__delete__") => Some(
+                        Place::bound(Type::WrapperDescriptor(
+                            WrapperDescriptorKind::PropertyDunderDelete,
+                        ))
+                        .into(),
+                    ),
 
                     _ => Some(class.class_member(db, env, name, policy)),
                 }
@@ -4150,6 +4146,36 @@ impl<'db> Type<'db> {
             }));
         }
 
+        // Slot access is fixed by the interpreter: class access returns the descriptor itself,
+        // and instance access directly reads the synthesized storage getter. Keeping this at the
+        // descriptor boundary avoids inventing specialized wrappers for public typeshed classes.
+        if let Type::PropertyInstance(descriptor) = self
+            && descriptor.is_slot_descriptor(db)
+            && let Some(getter) = descriptor.getter(db)
+        {
+            let Some(instance) = instance else {
+                return Ok(Some(DescriptorGetResult {
+                    return_type: self,
+                    kind: AttributeKind::DataDescriptor,
+                }));
+            };
+            let (return_type, error) =
+                match getter.try_call(db, env, &CallArguments::positional([instance])) {
+                    Ok(bindings) => (bindings.return_type(db, env), None),
+                    Err(error) => (
+                        error.return_type(db, env),
+                        Some(DescriptorGetCallContext::new(
+                            db,
+                            self,
+                            getter,
+                            Some(instance),
+                            owner,
+                        )),
+                    ),
+                };
+            return descriptor_get_result(return_type, AttributeKind::DataDescriptor, error);
+        }
+
         try_call_dunder_get_inner(db, env.program(db), self, instance, owner)
     }
 
@@ -5038,7 +5064,7 @@ impl<'db> Type<'db> {
                     if name == "__get__" && class.is_known(db, KnownClass::Property) =>
                 {
                     Place::bound(Type::WrapperDescriptor(
-                        WrapperDescriptorKind::PropertyDunderGet(KnownClass::Property),
+                        WrapperDescriptorKind::PropertyDunderGet,
                     ))
                     .into()
                 }
@@ -5046,7 +5072,7 @@ impl<'db> Type<'db> {
                     if name == "__set__" && class.is_known(db, KnownClass::Property) =>
                 {
                     Place::bound(Type::WrapperDescriptor(
-                        WrapperDescriptorKind::PropertyDunderSet(KnownClass::Property),
+                        WrapperDescriptorKind::PropertyDunderSet,
                     ))
                     .into()
                 }
@@ -5054,7 +5080,7 @@ impl<'db> Type<'db> {
                     if name == "__delete__" && class.is_known(db, KnownClass::Property) =>
                 {
                     Place::bound(Type::WrapperDescriptor(
-                        WrapperDescriptorKind::PropertyDunderDelete(KnownClass::Property),
+                        WrapperDescriptorKind::PropertyDunderDelete,
                     ))
                     .into()
                 }
