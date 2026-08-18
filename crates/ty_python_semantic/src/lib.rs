@@ -54,6 +54,8 @@ pub use types::{
 };
 
 mod db;
+#[allow(dead_code)]
+pub(crate) mod definition_resolution;
 mod dunder_all;
 mod fixes;
 pub mod lint;
