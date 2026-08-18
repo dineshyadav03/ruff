@@ -327,6 +327,9 @@ impl ScriptEnvironments {
                 );
             };
 
+            // Updating a Salsa input waits for outstanding snapshots to be dropped. Cancel
+            // them before taking the entry lock, which their queries may need to finish.
+            db.trigger_cancellation();
             let mut state = entry.state.lock();
             let ScriptEnvironmentState::SynchronizingInBackground {
                 environment, sync, ..
@@ -832,11 +835,15 @@ fn script_python(db: &dyn Db) -> Option<SystemPathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use anyhow::Context;
     use ruff_db::files::system_path_to_file;
     use ruff_db::system::{DbWithWritableSystem, SystemPath};
+    use salsa::Database as _;
 
-    use super::script_environment;
+    use super::{ScriptEnvironmentAvailability, script_environment};
     use crate::db::testing::TestDb;
     use crate::{Db as _, ProjectMetadata, UseUv};
 
@@ -859,6 +866,50 @@ mod tests {
         assert_eq!(environment.initialization_error(&db), None);
         assert!(!environments.is_initialization_pending(&db, file));
 
+        Ok(())
+    }
+
+    #[test]
+    fn background_result_cancels_snapshots_before_locking_entry() -> anyhow::Result<()> {
+        let path = SystemPath::new("/project/script.py");
+        let mut db = TestDb::new(
+            ProjectMetadata::new("test", "/project".into()).with_use_uv(UseUv::Scripts),
+        );
+        db.write_file(path, "# /// script\n# dependencies = []\n# ///\n")?;
+        let file = system_path_to_file(&db, path)?;
+        let environments = db.script_environments().clone();
+
+        // The in-memory system cannot run uv, so this immediately queues an error to apply.
+        environments.request_sync(
+            &mut db,
+            file,
+            ScriptEnvironmentAvailability::Pending,
+            &|_, _| None,
+        );
+        let entry = environments
+            .existing_entry(file)
+            .context("expected a script environment entry")?;
+        let snapshot = db.clone();
+        let reader = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while salsa::Cancelled::catch(|| snapshot.unwind_if_revision_cancelled()).is_ok() {
+                assert!(Instant::now() < deadline, "snapshot was not cancelled");
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            // A cancelled query may need this lock before it can drop its snapshot. Use a
+            // timeout so a regression fails instead of deadlocking the test itself.
+            assert!(
+                entry.state.try_lock_for(Duration::from_secs(1)).is_some(),
+                "the entry lock was held while waiting for a cancelled snapshot"
+            );
+            drop(snapshot);
+        });
+
+        assert_eq!(environments.poll_sync(&mut db), vec![file]);
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("reader panicked"))?;
         Ok(())
     }
 
